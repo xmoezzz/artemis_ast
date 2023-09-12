@@ -1,0 +1,12 @@
+[package]
+name = "artemis_ast"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+serde = "1.0"
+serde_yaml = "0.9"
+clap = { version = "4.4.2", features = ["derive"] }
+anyhow = { version = "*", features = ["backtrace"] }
