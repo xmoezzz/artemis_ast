@@ -10,6 +10,7 @@ enum Value {
     String(String),
     Array(Vec<Value>),
     Dictionary(HashMap<String, Value>),
+    SpContent(Option<i64>),
 }
 
 impl Value {
@@ -95,6 +96,7 @@ enum Token {
     StringLiteral(String),// "2.0", "俺たちの新しい日常" 等
     IntegerLiteral(i64),  // 整数
     FloatLiteral(f64),    // 浮点数
+    SpTagContent(Option<i64>),
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>> {
@@ -134,6 +136,29 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
                 }
                 tokens.push(Token::StringLiteral(s));
             }
+            '[' => {
+                chars.next();
+                let mut num_string = String::new();
+                loop {
+                    match chars.peek() {
+                        Some(&']') => {
+                            chars.next();
+                            break;
+                        }
+                        Some(&ch) if ch.is_digit(10) => {
+                            num_string.push(ch);
+                            chars.next();
+                        }
+                        None => return Err(anyhow!("Unexpected end of input while parsing sp content".to_string())),
+                        _ => break,
+                    }
+                }
+                if num_string.is_empty() {
+                    tokens.push(Token::SpTagContent(None));
+                } else {
+                    tokens.push(Token::SpTagContent(Some(num_string.parse::<i64>().unwrap())));
+                }
+            }
             _ if ch.is_whitespace() || ch == '\n' || ch == '\r' => {}
             _ if ch.is_numeric() || (ch == '-' && chars.peek().map_or(false, |next| next.is_numeric())) => {
                 let mut number = ch.to_string();
@@ -165,7 +190,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
                 }
                 tokens.push(Token::Identifier(name));
             }
-            _ => return Err(anyhow!("Unexpected character")),
+            _ => return Err(anyhow!(format!("Unexpected character: {}", ch))),
         }
     }
     Ok(tokens)
@@ -187,7 +212,16 @@ fn parse_tokens(tokens: &[Token]) -> Result<HashMap<String, Value>> {
                 } else {
                     anyhow::bail!("Expected '=' after Identifier");
                 }
-            }
+            },
+            // Token::SpTagContent(s) => {
+            //     index += 1;
+            //     if let Token::Equal = tokens[index] {
+            //         let value = parse_value(tokens, &mut index)?;
+            //         result.insert(s.clone(), value);
+            //     } else {
+            //         anyhow::bail!("Expected '=' after SpContent in root level");
+            //     }
+            // }
             _ => anyhow::bail!("Unexpected token at top level"),
         }
     }
@@ -219,6 +253,23 @@ fn parse_value(tokens: &[Token], index: &mut usize) -> Result<Value> {
                 Ok(Value::Dictionary(map))
             } else {
                 Ok(Value::String(s.clone()))
+            }
+        },
+        Token::SpTagContent(sp) => {
+            *index += 1;
+            if let Token::Equal = tokens[*index] {
+                *index += 1;  // Skip '='
+                let value = parse_value(tokens, index)?;
+                let mut map = HashMap::new();
+                // hack
+                let s = match sp {
+                    Some(sp) => format!("[{}]", sp),
+                    None => "[]".to_string(),
+                };
+                map.insert(s, value);
+                Ok(Value::Dictionary(map))
+            } else {
+                Ok(Value::SpContent(*sp))
             }
         }
         _ => anyhow::bail!(format!("Unexpected token: {:?}", tokens[*index])),
@@ -302,6 +353,56 @@ fn extract_secnario_toyaml(ast: &HashMap<String, Value>, output: impl AsRef<Path
     Ok(())
 }
 
+fn extract_secnario(ast: &HashMap<String, Value>) -> Result<Vec<String>> {
+    // extract all the text under the key "text"
+    let ast_array = ast.get("ast")
+        .ok_or(anyhow::anyhow!("ast key not found"))?
+        .as_array()
+        .ok_or(anyhow::anyhow!("ast is not a dictionary"))?;
+
+    let mut all_texts = Vec::new();
+    
+    for block_value in ast_array.iter() {
+        let blocks = block_value.as_dictionary().ok_or(anyhow::anyhow!("block is not a dict"))?;
+        for (block_key, block_dict) in blocks.iter() {
+            if !block_key.starts_with("block_") {
+                continue;
+            }
+            if let Some(block_items) = block_dict.as_array() {
+                for block_item in block_items {
+                    if let Some(block_item) = block_item.as_dictionary() {
+                        if let Some(text_value) = block_item.get("text") {
+                            if let Some(text_array) = text_value.as_array() {
+                                for text_block in text_array.iter() {
+                                    let ja_texts = text_block.as_dictionary();
+                                    if let Some(ja_texts) = ja_texts {
+                                        if let Some(ja_texts) = ja_texts.get("ja") {
+                                            if let Some(ja_texts) = ja_texts.as_array() {
+                                                for subja in ja_texts {
+                                                    if let Some(subja) = subja.as_array() {
+                                                        for subj in subja.iter() {
+                                                            if let Some(subj) = subj.as_string() {
+                                                                all_texts.push(subj.to_string());
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(all_texts)
+}
+
 
 
 fn replace_secnario(ast: &mut HashMap<String, Value>, secnario: Vec<String>) -> Result<()> {
@@ -356,6 +457,11 @@ fn replace_secnario(ast: &mut HashMap<String, Value>, secnario: Vec<String>) -> 
 
 fn parse_ast(filename: impl AsRef<Path>) -> Result<HashMap<String, Value>> {
     let input = std::fs::read_to_string(filename)?;
+    // hack 
+    if input.starts_with("[]") {
+        return Ok(HashMap::new());
+    }
+
     let tokens = tokenize(&input)?;
     parse_tokens(&tokens)
 }
@@ -397,6 +503,13 @@ fn value_to_script(value: &Value, indent_level: usize) -> Result<String> {
             }
             Ok(format!("\n{}{}\n{}", next_indent, contents.join(&format!(",\n{}", next_indent)), indent))
         }
+        Value::SpContent(sp) => {
+            let c = match sp {
+                Some(sp) => format!("[{}]", sp),
+                None => "[]".to_string(),
+            };
+            Ok(c)
+        },
     }
 }
 
@@ -463,24 +576,69 @@ enum Commands {
 }
 
 
+fn build_replacement_map(original_texts: Vec<String>, replacement_texts: Vec<String>) -> HashMap<String, String> {
+    original_texts.into_iter().zip(replacement_texts.into_iter()).collect()
+}
+
+fn replace_strings_in_script(script: &str, replacements: &HashMap<String, String>) -> Result<String> {
+    let mut output = String::new();
+    let mut used_replacements = HashMap::new();
+
+    for line in script.lines() {
+        let mut new_line = line.to_string();
+        for (to_replace, replace_with) in replacements.iter() {
+            // 替换带引号的字符串
+            let quoted_to_replace = format!("\"{}\"", to_replace);
+            let quoted_replace_with = format!("\"{}\"", replace_with);
+            if new_line.contains(&quoted_to_replace) {
+                new_line = new_line.replace(&quoted_to_replace, &quoted_replace_with);
+                used_replacements.insert(to_replace.clone(), true);
+            }
+        }
+        output.push_str(&new_line);
+        output.push('\n');
+    }
+
+    // 确保所有替换都已完成
+    if used_replacements.len() != replacements.len() {
+        return Err(anyhow::anyhow!("Not all replacements were used!"));
+    }
+
+    Ok(output)
+}
+
 fn main() {
     let cli = Args::parse();
     match &cli.command {
         Commands::Extract { input, output } => {
+            println!("Extracting secnario text from {} to {}", input.display(), output.display());
             let ast = parse_ast(input).unwrap();
+            if ast.is_empty() {
+                return;
+            }
             extract_secnario_toyaml(&ast, output).unwrap();
         },
         Commands::Prune { input, output } => {
             let mut ast = parse_ast(input).unwrap();
+            if ast.is_empty() {
+                return;
+            }
             prune_ast(&mut ast);
             let s = reconstruct_script(&ast).unwrap();
             std::fs::write(output, s).unwrap();
         },
         Commands::Merge { ast_input, yaml_input, output } => {
             let mut ast = parse_ast(ast_input).unwrap();
+            if ast.is_empty() {
+                return;
+            }
+            let old_secnario = extract_secnario(&ast).unwrap();
             let secnario = read_yaml_as_strings(yaml_input).unwrap();
-            replace_secnario(&mut ast, secnario).unwrap();
-            let s = reconstruct_script(&ast).unwrap();
+            let rp = build_replacement_map(old_secnario, secnario);
+            let s = replace_strings_in_script(&std::fs::read_to_string(ast_input).unwrap(), &rp).unwrap();
+
+            // replace_secnario(&mut ast, secnario).unwrap();
+            // let s = reconstruct_script(&ast).unwrap();
             std::fs::write(output, s).unwrap();
         }
     }
